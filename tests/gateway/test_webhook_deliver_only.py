@@ -119,6 +119,44 @@ class TestDeliverOnlyBypassesAgent:
         assert chat_id_arg == "12345"
         assert content_arg == "alice matched with bob!"
 
+    @pytest.mark.asyncio
+    async def test_owner_reply_context_is_private_delivery_metadata(self):
+        """Structured owner context reaches Telegram, never the rendered body."""
+        case_id = "123e4567-e89b-42d3-a456-426614174000"
+        routes = {
+            "owner-bridge": {
+                "secret": _INSECURE_NO_AUTH,
+                "deliver": "telegram",
+                "deliver_only": True,
+                "deliver_extra": {"chat_id": "12345"},
+                "prompt": "{owner_summary}",
+            }
+        }
+        adapter = _make_adapter(routes)
+        target = _wire_mock_target(adapter)
+        delivery = {
+            "deliver": "telegram",
+            "deliver_extra": {"chat_id": "12345"},
+            "owner_reply_context": {
+                "case_id": case_id,
+                "project_ref": "fareeq-stores",
+                "tenant_ref": "tenant-opaque-1",
+                "owner_telegram_user_id": "777",
+            },
+            "delivery_id": "event-1",
+        }
+
+        await adapter._direct_deliver("تنبيه للمالك", delivery)
+
+        target.send.assert_awaited_once_with(
+            "12345",
+            "تنبيه للمالك",
+            metadata={
+                "owner_reply_context": delivery["owner_reply_context"],
+                "owner_reply_delivery_id": "event-1",
+            },
+        )
+
 
 # ===================================================================
 # HTTP status codes

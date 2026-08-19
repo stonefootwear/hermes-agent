@@ -862,6 +862,10 @@ class WebhookAdapter(BasePlatformAdapter):
                     route_config.get("deliver_extra", {}), payload
                 ),
                 "payload": payload,
+                # Private pass-through for a receipt hook.  It never enters
+                # prompt rendering and only Telegram direct delivery consumes it.
+                "owner_reply_context": payload.get("owner_reply_context"),
+                "delivery_id": delivery_id,
             }
             logger.info(
                 "[webhook] direct-deliver event=%s route=%s target=%s msg_len=%d delivery=%s",
@@ -1458,5 +1462,14 @@ class WebhookAdapter(BasePlatformAdapter):
         thread_id = extra.get("message_thread_id") or extra.get("thread_id")
         if thread_id:
             metadata = {"thread_id": thread_id}
+
+        # Owner-reply context is private, structured receipt metadata.  It is
+        # accepted only on a direct Telegram delivery and is deliberately not
+        # part of the rendered prompt/body (or any agent turn).
+        owner_reply_context = delivery.get("owner_reply_context")
+        if platform_name == "telegram" and isinstance(owner_reply_context, dict):
+            metadata = dict(metadata or {})
+            metadata["owner_reply_context"] = owner_reply_context
+            metadata["owner_reply_delivery_id"] = str(delivery.get("delivery_id") or "")
 
         return await adapter.send(chat_id, content, metadata=metadata)
