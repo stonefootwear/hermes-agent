@@ -405,6 +405,9 @@ ENV HERMES_LAZY_INSTALL_TARGET=/opt/data/lazy-packages
 # the opt-out env var (HERMES_DOCKER_EXEC_AS_ROOT=1).
 COPY --chmod=0755 docker/hermes-exec-shim.sh /opt/hermes/bin/hermes
 COPY --chmod=0755 docker/entrypoint-dispatch.sh /opt/hermes/docker/entrypoint-dispatch.sh
+COPY --chmod=0755 railway-runtime/start.sh /usr/local/bin/hermes-railway-start
+RUN python3 -c 'from pathlib import Path; p=Path("/opt/hermes/docker/stage2-hook.sh"); s=p.read_text(); old="if [ -f \"$HERMES_HOME/.env\" ] && ! grep -q"; new="if [ -z \"${API_SERVER_KEY:-}\" ] && "+old; assert old in s; p.write_text(s.replace(old, new, 1))' && \
+    printf '%s\n' '70ff57c1074d3df4ee80661ca0783c89f7fa38e7' > /opt/hermes/.hermes_build_sha
 
 # Pre-s6 entrypoint.sh did `source .venv/bin/activate` which exported
 # the venv bin onto PATH; Architecture B's main-wrapper.sh does the
@@ -454,4 +457,4 @@ VOLUME [ "/opt/data" ]
 # wrapper-as-ENTRYPOINT, leading-dash args like `--version` would be
 # intercepted by /init's POSIX shell.
 ENTRYPOINT [ "/opt/hermes/docker/entrypoint-dispatch.sh" ]
-CMD [ ]
+CMD [ "hermes-railway-start" ]
