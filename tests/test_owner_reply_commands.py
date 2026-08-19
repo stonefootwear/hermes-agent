@@ -1,145 +1,62 @@
 import asyncio
-import os
+import multiprocessing
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-
 from gateway.owner_reply_context import OwnerReplyContextStore
 
 
-CASE_ID = "123e4567-e89b-42d3-a456-426614174000"
+def _bind(store, expiry=4_102_444_800.0):
+    return store.bind(platform="telegram", chat_id="100", delivered_message_id="200", owner_user_id="owner-1", session_id="session-1", binding_assertion="signed.assertion.without-case-id", expires_at=expiry)
 
+def _claim(path, queue):
+    value = OwnerReplyContextStore(home=path).claim_reply(platform="telegram", chat_id="100", reply_to_message_id="200", owner_user_id="owner-1", session_id="session-1")
+    queue.put(value is not None)
 
-def _binding(store, *, expires_at=4_102_444_800.0):
-    store.bind(
-        platform="telegram",
-        chat_id="100",
-        delivered_message_id="200",
-        owner_user_id="owner-1",
-        case_id=CASE_ID,
-        project_ref="fareeq-stores",
-        tenant_ref="tenant-opaque-1",
-        session_id="session-1",
-        expires_at=expires_at,
-    )
-
-
-def test_bind_persists_only_validated_opaque_metadata(tmp_path):
+def test_binding_handle_is_random_and_storage_has_no_case_identifier(tmp_path):
     store = OwnerReplyContextStore(home=tmp_path)
-    _binding(store)
+    handle = _bind(store)
+    assert len(handle) == 32
+    assert "123e4567" not in store.path.read_bytes().decode("latin1")
+    binding = store.resolve_reply(platform="telegram", chat_id="100", reply_to_message_id="200", owner_user_id="owner-1", session_id="session-1")
+    assert binding and binding.binding_handle == handle
 
-    binding = store.resolve_reply(
-        platform="telegram", chat_id="100", reply_to_message_id="200", owner_user_id="owner-1"
-    )
-
-    assert binding is not None
-    assert binding.case_id == CASE_ID
-    assert binding.project_ref == "fareeq-stores"
-    assert binding.tenant_ref == "tenant-opaque-1"
-    assert "content" not in store.path.read_text(encoding="utf-8")
-
-
-def test_bind_rejects_missing_or_invalid_opaque_metadata(tmp_path):
-    store = OwnerReplyContextStore(home=tmp_path)
-    with pytest.raises(ValueError):
-        store.bind(
-            platform="telegram", chat_id="100", delivered_message_id="200",
-            owner_user_id="owner-1", case_id="not-a-uuid", project_ref="fareeq",
-            tenant_ref="tenant", session_id="session", expires_at=4_102_444_800,
-        )
-    assert store.resolve_reply(
-        platform="telegram", chat_id="100", reply_to_message_id="200", owner_user_id="owner-1"
-    ) is None
-
+def test_two_processes_can_claim_only_once(tmp_path):
+    store = OwnerReplyContextStore(home=tmp_path); _bind(store)
+    queue = multiprocessing.Queue()
+    processes = [multiprocessing.Process(target=_claim, args=(tmp_path, queue)) for _ in range(2)]
+    [p.start() for p in processes]; [p.join(10) for p in processes]
+    assert [queue.get() for _ in processes].count(True) == 1
 
 @pytest.mark.asyncio
-async def test_bound_reply_drafts_without_model_and_consumes_binding(monkeypatch, tmp_path):
+async def test_wrong_session_chat_user_or_quote_never_calls_service(monkeypatch, tmp_path):
     from gateway.owner_reply_commands import handle_bound_owner_reply
-
-    store = OwnerReplyContextStore(home=tmp_path)
-    _binding(store)
-    post = AsyncMock(side_effect=[
-        {"summary": "حالة دعم بانتظار رد المالك.", "capability": "draft-cap", "expiresInSeconds": 120},
-        {"status": "waiting_owner"},
-    ])
-    monkeypatch.setenv("HERMES_OWNER_REPLY_EXCHANGE_TOKEN", "x" * 32)
-    source = SimpleNamespace(platform="telegram", chat_id="100", user_id="owner-1")
-    event = SimpleNamespace(reply_to_message_id="200", text="نص الرد")
-
-    result = await handle_bound_owner_reply(
-        event, source, store=store,
-        config={"endpoint": "https://fareeq.private/api/internal/support-cases/exchange"},
-        post_json=post,
-    )
-
-    assert result == "تم حفظ المسودة."
-    assert post.await_args_list[0].args[0].endswith("/exchange")
-    assert post.await_args_list[0].args[1] == {"caseId": CASE_ID, "action": "draft"}
-    assert post.await_args_list[1].args[0].endswith("/draft")
-    assert post.await_args_list[1].args[1] == {"draft": "نص الرد"}
-    assert all("draft-cap" not in str(call.args[1]) for call in post.await_args_list)
-    assert store.resolve_reply(
-        platform="telegram", chat_id="100", reply_to_message_id="200", owner_user_id="owner-1"
-    ) is None
-
-
-@pytest.mark.asyncio
-async def test_literal_send_uses_send_capability_and_real_server_result(monkeypatch, tmp_path):
-    from gateway.owner_reply_commands import handle_bound_owner_reply
-
-    store = OwnerReplyContextStore(home=tmp_path)
-    _binding(store)
-    post = AsyncMock(side_effect=[
-        {"summary": "حالة دعم بانتظار رد المالك.", "capability": "send-cap", "expiresInSeconds": 120},
-        {"status": "sent_to_merchant"},
-    ])
-    monkeypatch.setenv("HERMES_OWNER_REPLY_EXCHANGE_TOKEN", "x" * 32)
-    source = SimpleNamespace(platform="telegram", chat_id="100", user_id="owner-1")
-    event = SimpleNamespace(reply_to_message_id="200", text="ابعت")
-
-    result = await handle_bound_owner_reply(
-        event, source, store=store,
-        config={"endpoint": "https://fareeq.private/api/internal/support-cases/exchange"},
-        post_json=post,
-    )
-
-    assert result == "تم إرسال الرد بنجاح."
-    assert post.await_args_list[0].args[1] == {"caseId": CASE_ID, "action": "send"}
-    assert post.await_args_list[1].args[0].endswith("/send")
-    assert post.await_args_list[1].args[1] == {"reply": "ابعت", "confirmation": "ابعت"}
-
-
-@pytest.mark.asyncio
-async def test_wrong_chat_user_or_no_quote_never_calls_private_service(monkeypatch, tmp_path):
-    from gateway.owner_reply_commands import handle_bound_owner_reply
-
-    store = OwnerReplyContextStore(home=tmp_path)
-    _binding(store)
-    post = AsyncMock()
-    monkeypatch.setenv("HERMES_OWNER_REPLY_EXCHANGE_TOKEN", "x" * 32)
-    config = {"endpoint": "https://fareeq.private/api/internal/support-cases/exchange"}
-    for source, event in (
-        (SimpleNamespace(platform="telegram", chat_id="wrong", user_id="owner-1"), SimpleNamespace(reply_to_message_id="200", text="رد")),
-        (SimpleNamespace(platform="telegram", chat_id="100", user_id="wrong"), SimpleNamespace(reply_to_message_id="200", text="رد")),
-        (SimpleNamespace(platform="telegram", chat_id="100", user_id="owner-1"), SimpleNamespace(reply_to_message_id=None, text="رد")),
-    ):
-        assert await handle_bound_owner_reply(event, source, store=store, config=config, post_json=post) is None
+    store = OwnerReplyContextStore(home=tmp_path); _bind(store); monkeypatch.setenv("HERMES_OWNER_REPLY_EXCHANGE_TOKEN", "x" * 32)
+    post = AsyncMock(); config={"endpoint":"https://fareeq.test/api/internal/support-cases/exchange"}
+    for chat, user, session, quote in [("wrong","owner-1","session-1","200"),("100","wrong","session-1","200"),("100","owner-1","wrong","200"),("100","owner-1","session-1",None)]:
+        source=SimpleNamespace(platform="telegram",chat_id=chat,user_id=user,session_id=session)
+        assert await handle_bound_owner_reply(SimpleNamespace(reply_to_message_id=quote,text="reply"),source,store=store,config=config,post_json=post) is None
     post.assert_not_awaited()
 
+@pytest.mark.asyncio
+async def test_command_uses_opaque_handles_idempotency_and_success_allowlist(monkeypatch, tmp_path):
+    from gateway.owner_reply_commands import handle_bound_owner_reply
+    store=OwnerReplyContextStore(home=tmp_path); _bind(store); monkeypatch.setenv("HERMES_OWNER_REPLY_EXCHANGE_TOKEN", "x"*32)
+    post=AsyncMock(side_effect=[{"actionHandle":"a"*48},{"status":"waiting_owner"}])
+    source=SimpleNamespace(platform="telegram",chat_id="100",user_id="owner-1",session_id="session-1")
+    assert await handle_bound_owner_reply(SimpleNamespace(reply_to_message_id="200",text="reply"),source,store=store,config={"endpoint":"https://fareeq.test/api/internal/support-cases/exchange"},post_json=post)=="تم حفظ المسودة."
+    exchange=post.await_args_list[0].args[1]; action=post.await_args_list[1].args[1]
+    assert "caseId" not in exchange and exchange["commandId"] == action["commandId"]
+    assert await handle_bound_owner_reply(SimpleNamespace(reply_to_message_id="200",text="reply"),source,store=store,config={"endpoint":"https://fareeq.test/api/internal/support-cases/exchange"},post_json=post) is None
 
 @pytest.mark.asyncio
-async def test_exchange_error_fails_closed_and_replay_does_not_retry(monkeypatch, tmp_path):
+async def test_http_and_failed_status_fail_closed(monkeypatch,tmp_path):
     from gateway.owner_reply_commands import handle_bound_owner_reply
-
-    store = OwnerReplyContextStore(home=tmp_path)
-    _binding(store)
-    post = AsyncMock(side_effect=RuntimeError("exchange unavailable"))
-    monkeypatch.setenv("HERMES_OWNER_REPLY_EXCHANGE_TOKEN", "x" * 32)
-    source = SimpleNamespace(platform="telegram", chat_id="100", user_id="owner-1")
-    event = SimpleNamespace(reply_to_message_id="200", text="رد")
-    config = {"endpoint": "https://fareeq.private/api/internal/support-cases/exchange"}
-
-    assert await handle_bound_owner_reply(event, source, store=store, config=config, post_json=post) == "تعذر تنفيذ الرد بأمان."
-    assert await handle_bound_owner_reply(event, source, store=store, config=config, post_json=post) is None
-    assert post.await_count == 1
+    store=OwnerReplyContextStore(home=tmp_path); _bind(store); monkeypatch.setenv("HERMES_OWNER_REPLY_EXCHANGE_TOKEN", "x"*32)
+    source=SimpleNamespace(platform="telegram",chat_id="100",user_id="owner-1",session_id="session-1")
+    post=AsyncMock()
+    assert await handle_bound_owner_reply(SimpleNamespace(reply_to_message_id="200",text="reply"),source,store=store,config={"endpoint":"http://fareeq.test/api/internal/support-cases/exchange"},post_json=post)=="تعذر تنفيذ الرد بأمان."
+    post.assert_not_awaited()
+    post.side_effect=[{"actionHandle":"a"*48},{"status":"unexpected"}]
+    assert await handle_bound_owner_reply(SimpleNamespace(reply_to_message_id="200",text="reply"),source,store=store,config={"endpoint":"https://fareeq.test/api/internal/support-cases/exchange"},post_json=post)=="تعذر تنفيذ الرد بأمان."
