@@ -6570,7 +6570,6 @@ class BasePlatformAdapter(ABC):
                                 delivered_message_id=result.message_id,
                                 owner_user_id=getattr(event.source, "user_id", None),
                                 session_id=session_key,
-                                content=text_content,
                             )
                         except Exception:
                             logger.debug("Owner reply-context receipt failed", exc_info=True)
