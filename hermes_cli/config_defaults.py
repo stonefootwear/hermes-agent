@@ -10,6 +10,13 @@ DEFAULT_CONFIG = {
     "fallback_providers": [],
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
+    # Private, server-side path for Telegram owners replying to a bound support
+    # alert. The endpoint is behavior configuration; the named credential lives
+    # only in the environment/.env and is never exposed to a model.
+    "owner_reply": {
+        "endpoint": "",
+        "credential_env": "HERMES_OWNER_REPLY_EXCHANGE_TOKEN",
+    },
     # SQLite journal mode used by every Hermes database opener. WAL is the
     # normal default; set DELETE for weak-fsync/shared filesystems where WAL is
     # not crash-safe (for example macOS virtiofs, NFS, or SMB).

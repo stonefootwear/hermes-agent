@@ -1463,13 +1463,32 @@ class WebhookAdapter(BasePlatformAdapter):
         if thread_id:
             metadata = {"thread_id": thread_id}
 
-        # Owner-reply context is private, structured receipt metadata.  It is
-        # accepted only on a direct Telegram delivery and is deliberately not
-        # part of the rendered prompt/body (or any agent turn).
+        # The opaque context stays in this adapter only; it is not forwarded to
+        # Telegram or incorporated into rendered content.
         owner_reply_context = delivery.get("owner_reply_context")
-        if platform_name == "telegram" and isinstance(owner_reply_context, dict):
-            metadata = dict(metadata or {})
-            metadata["owner_reply_context"] = owner_reply_context
-            metadata["owner_reply_delivery_id"] = str(delivery.get("delivery_id") or "")
 
-        return await adapter.send(chat_id, content, metadata=metadata)
+        result = await adapter.send(chat_id, content, metadata=metadata)
+        # Bind only after Telegram accepted the direct delivery and returned its
+        # concrete message id.  This remains completely outside rendered text
+        # and any model/session path.
+        if (
+            platform_name == "telegram"
+            and getattr(result, "success", False)
+            and getattr(result, "message_id", None)
+            and isinstance(owner_reply_context, dict)
+        ):
+            try:
+                from gateway.owner_reply_context import bind_successful_direct_delivery
+
+                await asyncio.to_thread(
+                    bind_successful_direct_delivery,
+                    platform="telegram",
+                    chat_id=chat_id,
+                    delivered_message_id=result.message_id,
+                    context=owner_reply_context,
+                )
+            except Exception:
+                # A malformed or unpersistable binding must never turn an
+                # otherwise confirmed alert into a capability.
+                logger.warning("[webhook] owner reply binding rejected", exc_info=True)
+        return result

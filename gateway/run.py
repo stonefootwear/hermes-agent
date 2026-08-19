@@ -16209,6 +16209,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
 
+        # Bound Telegram owner replies are a server-side command surface, not a
+        # conversation turn. Resolve and consume their opaque receipt only after
+        # authorization, before any session/model/agent work can begin.
+        if not is_internal:
+            try:
+                from gateway.owner_reply_commands import handle_bound_owner_reply
+
+                _owner_reply_result = await handle_bound_owner_reply(
+                    event,
+                    source,
+                    config=(_load_gateway_config().get("owner_reply") or {}),
+                )
+                if _owner_reply_result is not None:
+                    return _owner_reply_result
+            except Exception:
+                # Fail closed: a broken private integration never falls through
+                # with bound IDs or capabilities into an LLM turn.
+                logger.warning("Owner reply command path failed closed", exc_info=True)
+                if getattr(event, "reply_to_message_id", None):
+                    return "تعذر تنفيذ الرد بأمان."
+
         # Global emergency stop (`hermes pause`): give new turns a brief
         # paused notice instead of starting an agent run. Internal events
         # (background-process completions from IN-FLIGHT work) bypass the
@@ -17922,22 +17943,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             else:
                 message_text = f'[Replying to: "{reply_snippet}"]\n\n{message_text}'
-
-        # Telegram does not reliably include quoted text for a reply to a bot
-        # message.  After the gateway's authorization path has admitted this
-        # event, recover only a receipt bound to this same owner identity and
-        # chat.  This is current-turn user content, never session/system prompt
-        # state, preserving prompt-cache prefixes and role alternation.
-        try:
-            from gateway.owner_reply_context import reply_context_for_event
-
-            owner_reply_context = await asyncio.to_thread(
-                reply_context_for_event, event, source
-            )
-            if owner_reply_context:
-                message_text = f"{owner_reply_context}\n\n{message_text}"
-        except Exception:
-            logger.debug("Owner reply-context lookup failed", exc_info=True)
 
         if "@" in message_text:
             try:

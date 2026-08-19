@@ -148,14 +148,35 @@ class TestDeliverOnlyBypassesAgent:
 
         await adapter._direct_deliver("تنبيه للمالك", delivery)
 
-        target.send.assert_awaited_once_with(
-            "12345",
-            "تنبيه للمالك",
-            metadata={
-                "owner_reply_context": delivery["owner_reply_context"],
-                "owner_reply_delivery_id": "event-1",
+        target.send.assert_awaited_once_with("12345", "تنبيه للمالك", metadata=None)
+
+    @pytest.mark.asyncio
+    async def test_binds_confirmed_telegram_delivery_with_opaque_metadata(self, monkeypatch, tmp_path):
+        from gateway.owner_reply_context import OwnerReplyContextStore
+
+        store = OwnerReplyContextStore(home=tmp_path)
+        monkeypatch.setattr("gateway.owner_reply_context.OwnerReplyContextStore", lambda: store)
+        adapter = _make_adapter({})
+        target = _wire_mock_target(adapter)
+        target.send = AsyncMock(return_value=SendResult(success=True, message_id="444"))
+        delivery = {
+            "deliver": "telegram", "deliver_extra": {"chat_id": "12345"},
+            "owner_reply_context": {
+                "case_id": "123e4567-e89b-42d3-a456-426614174000",
+                "project_ref": "fareeq-stores", "tenant_ref": "tenant-opaque-1",
+                "owner_telegram_user_id": "777", "session_id": "owner-session-1",
+                "expires_at": 4102444800,
             },
+        }
+
+        await adapter._direct_deliver("تنبيه للمالك", delivery)
+
+        binding = store.resolve_reply(
+            platform="telegram", chat_id="12345", reply_to_message_id="444", owner_user_id="777"
         )
+        assert binding is not None
+        assert binding.case_id == delivery["owner_reply_context"]["case_id"]
+        assert "تنبيه للمالك" not in store.path.read_text(encoding="utf-8")
 
 
 # ===================================================================

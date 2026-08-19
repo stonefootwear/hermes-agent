@@ -1,31 +1,27 @@
-"""Durable, profile-scoped binding metadata for owner replies.
+"""Durable, profile-scoped opaque bindings for owner support replies.
 
-The gateway records a receipt only after a final response was accepted by a
-platform. On a later authorized inbound Telegram reply, the message preparation
-path can recover an opaque binding for the reply target even when Telegram does
-not include quoted text in its update.
-
-Delivered assistant text is intentionally neither persisted nor injected: reply
-binding requires identity and reference metadata only.
+Bindings deliberately retain only validated routing references.  They never
+contain alert/reply text, private case context, credentials, or capabilities.
 """
-
 from __future__ import annotations
 
 import json
 import os
 import re
 import tempfile
+import threading
 import time
+import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Optional
 
 from hermes_cli.config import get_hermes_home
 
-
 _STORE_FILENAME = "owner_reply_context.json"
 _MAX_BINDINGS = 500
 _SAFE_METADATA_VALUE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}\Z")
+_STORE_LOCK = threading.RLock()
 
 
 @dataclass(frozen=True)
@@ -36,26 +32,27 @@ class OwnerReplyBinding:
     owner_user_id: str
     session_id: str
     recorded_at: float
+    case_id: str = ""
+    project_ref: str = ""
+    tenant_ref: str = ""
+    expires_at: float = 0.0
 
 
 def _platform_value(platform: Any) -> str:
-    """Normalize enum-backed platform values at both receipt and lookup seams."""
     return str(getattr(platform, "value", platform) or "").lower()
 
 
 def _safe_metadata_value(value: Any) -> Optional[str]:
-    """Allow only scalar IDs safe to interpolate into a fixed metadata note."""
     scalar = str(value or "")
     return scalar if _SAFE_METADATA_VALUE.fullmatch(scalar) else None
 
 
 class OwnerReplyContextStore:
-    """Small JSON binding store rooted under the active profile home."""
+    """Small atomic JSON store rooted under the active profile home."""
 
     def __init__(self, home: Optional[Path] = None) -> None:
         self.home = Path(home) if home is not None else get_hermes_home()
         self.path = self.home / _STORE_FILENAME
-        # Scrub legacy assistant text before this store can resolve any binding.
         self._read()
 
     @staticmethod
@@ -69,18 +66,14 @@ class OwnerReplyContextStore:
             return {}
         if not isinstance(data, dict):
             return {}
-
         sanitized = {
             key: {field: value for field, value in raw.items() if field != "content"}
-            if isinstance(raw, dict) and "content" in raw
-            else raw
+            if isinstance(raw, dict) and "content" in raw else raw
             for key, raw in data.items()
         }
         if sanitized == data:
             return data
         try:
-            # Do not expose a legacy binding unless its on-disk assistant text
-            # has first been removed by the atomic writer.
             self._write(sanitized)
         except OSError:
             return {}
@@ -88,9 +81,7 @@ class OwnerReplyContextStore:
 
     def _write(self, bindings: dict[str, dict[str, Any]]) -> None:
         self.home.mkdir(parents=True, exist_ok=True)
-        fd, temporary_name = tempfile.mkstemp(
-            prefix=f".{_STORE_FILENAME}.", dir=self.home, text=True
-        )
+        fd, temporary_name = tempfile.mkstemp(prefix=f".{_STORE_FILENAME}.", dir=self.home, text=True)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 json.dump(bindings, handle, ensure_ascii=False, separators=(",", ":"))
@@ -103,104 +94,124 @@ class OwnerReplyContextStore:
             except FileNotFoundError:
                 pass
 
-    def record_delivery(
-        self,
-        *,
-        platform: Any,
-        chat_id: str,
-        delivered_message_id: str,
-        owner_user_id: str,
-        session_id: str,
-    ) -> None:
-        """Persist a receipt when all identity and reference fields are present."""
-        if _platform_value(platform) != "telegram":
-            return
-        values = (chat_id, delivered_message_id, owner_user_id, session_id)
-        if not all(str(value).strip() for value in values):
-            return
-        binding = OwnerReplyBinding(
-            platform="telegram",
-            chat_id=str(chat_id),
-            delivered_message_id=str(delivered_message_id),
-            owner_user_id=str(owner_user_id),
-            session_id=str(session_id),
-            recorded_at=time.time(),
-        )
+    def _put(self, binding: OwnerReplyBinding) -> None:
         bindings = self._read()
         bindings[self._key(binding.chat_id, binding.delivered_message_id)] = asdict(binding)
         if len(bindings) > _MAX_BINDINGS:
-            oldest = sorted(
-                bindings,
-                key=lambda key: float(bindings[key].get("recorded_at", 0) or 0),
-            )[: len(bindings) - _MAX_BINDINGS]
+            oldest = sorted(bindings, key=lambda key: float(bindings[key].get("recorded_at", 0) or 0))[
+                : len(bindings) - _MAX_BINDINGS
+            ]
             for key in oldest:
                 bindings.pop(key, None)
         self._write(bindings)
 
-    def resolve_reply(
-        self,
-        *,
-        platform: Any,
-        chat_id: str,
-        reply_to_message_id: str,
-        owner_user_id: str,
-    ) -> Optional[OwnerReplyBinding]:
-        """Return a binding only for the same Telegram chat and owner identity."""
+    def bind(self, *, platform: Any, chat_id: Any, delivered_message_id: Any,
+             owner_user_id: Any, case_id: Any, project_ref: Any, tenant_ref: Any,
+             session_id: Any, expires_at: Any) -> None:
+        """Bind a confirmed Telegram delivery to strictly opaque command metadata."""
+        values = [str(value or "") for value in (chat_id, delivered_message_id, owner_user_id,
+                                                   project_ref, tenant_ref, session_id)]
+        if _platform_value(platform) != "telegram" or any(
+            _safe_metadata_value(value) is None for value in values
+        ):
+            raise ValueError("invalid owner reply binding metadata")
+        try:
+            normalized_case_id = str(uuid.UUID(str(case_id)))
+            expiry = float(expires_at)
+        except (ValueError, TypeError):
+            raise ValueError("invalid owner reply binding metadata") from None
+        if expiry <= time.time():
+            raise ValueError("expired owner reply binding")
+        self._put(OwnerReplyBinding(
+            platform="telegram", chat_id=values[0], delivered_message_id=values[1],
+            owner_user_id=values[2], case_id=normalized_case_id, project_ref=values[3],
+            tenant_ref=values[4], session_id=values[5], expires_at=expiry, recorded_at=time.time(),
+        ))
+
+    def record_delivery(self, *, platform: Any, chat_id: str, delivered_message_id: str,
+                        owner_user_id: str, session_id: str) -> None:
+        """Compatibility receipt without command capability (never command-routable)."""
+        values = (chat_id, delivered_message_id, owner_user_id, session_id)
+        if _platform_value(platform) != "telegram" or not all(str(value).strip() for value in values):
+            return
+        self._put(OwnerReplyBinding(platform="telegram", chat_id=str(chat_id),
+                  delivered_message_id=str(delivered_message_id), owner_user_id=str(owner_user_id),
+                  session_id=str(session_id), recorded_at=time.time()))
+
+    def resolve_reply(self, *, platform: Any, chat_id: Any, reply_to_message_id: Any,
+                      owner_user_id: Any) -> Optional[OwnerReplyBinding]:
         if _platform_value(platform) != "telegram":
             return None
-        if not all(str(value).strip() for value in (chat_id, reply_to_message_id, owner_user_id)):
+        if not all(str(value or "").strip() for value in (chat_id, reply_to_message_id, owner_user_id)):
             return None
         raw = self._read().get(self._key(str(chat_id), str(reply_to_message_id)))
         if not isinstance(raw, dict):
             return None
         try:
-            # Discard legacy stored content rather than retaining it in memory.
             binding = OwnerReplyBinding(**{key: value for key, value in raw.items() if key != "content"})
         except (TypeError, ValueError):
             return None
-        if (
-            binding.platform != "telegram"
-            or binding.chat_id != str(chat_id)
-            or binding.delivered_message_id != str(reply_to_message_id)
-            or binding.owner_user_id != str(owner_user_id)
-        ):
+        if (binding.platform != "telegram" or binding.chat_id != str(chat_id)
+                or binding.delivered_message_id != str(reply_to_message_id)
+                or binding.owner_user_id != str(owner_user_id)):
             return None
         return binding
 
+    def claim_reply(self, *, platform: Any, chat_id: Any, reply_to_message_id: Any,
+                    owner_user_id: Any) -> Optional[OwnerReplyBinding]:
+        """Atomically consume one valid opaque command binding; fail closed otherwise."""
+        if _platform_value(platform) != "telegram":
+            return None
+        if not all(str(value or "").strip() for value in (chat_id, reply_to_message_id, owner_user_id)):
+            return None
+        with _STORE_LOCK:
+            raw = self._read().get(self._key(str(chat_id), str(reply_to_message_id)))
+            if not isinstance(raw, dict):
+                return None
+            try:
+                binding = OwnerReplyBinding(**{key: value for key, value in raw.items() if key != "content"})
+            except (TypeError, ValueError):
+                return None
+            if (
+                binding.platform != "telegram" or binding.chat_id != str(chat_id)
+                or binding.delivered_message_id != str(reply_to_message_id)
+                or binding.owner_user_id != str(owner_user_id)
+                or binding.expires_at <= time.time() or not binding.case_id
+                or not binding.project_ref or not binding.tenant_ref
+            ):
+                return None
+            bindings = self._read()
+            key = self._key(binding.chat_id, binding.delivered_message_id)
+            if key not in bindings:
+                return None
+            bindings.pop(key, None)
+            try:
+                self._write(bindings)
+            except OSError:
+                return None
+            return binding
 
-def record_successful_delivery_receipt(
-    *,
-    platform: Any,
-    chat_id: Any,
-    delivered_message_id: Any,
-    owner_user_id: Any,
-    session_id: Any,
-) -> None:
-    """Post-success receipt hook used by gateway delivery; failures stay isolated."""
-    OwnerReplyContextStore().record_delivery(
-        platform=platform,
-        chat_id=str(chat_id or ""),
-        delivered_message_id=str(delivered_message_id or ""),
-        owner_user_id=str(owner_user_id or ""),
-        session_id=str(session_id or ""),
+
+def bind_successful_direct_delivery(*, platform: Any, chat_id: Any, delivered_message_id: Any,
+                                     context: Any) -> None:
+    """Post-ack receipt hook for direct webhook delivery only."""
+    if not isinstance(context, dict):
+        return
+    OwnerReplyContextStore().bind(
+        platform=platform, chat_id=chat_id, delivered_message_id=delivered_message_id,
+        owner_user_id=context.get("owner_telegram_user_id"), case_id=context.get("case_id"),
+        project_ref=context.get("project_ref"), tenant_ref=context.get("tenant_ref"),
+        session_id=context.get("session_id"), expires_at=context.get("expires_at"),
     )
+
+
+def record_successful_delivery_receipt(*, platform: Any, chat_id: Any, delivered_message_id: Any,
+                                       owner_user_id: Any, session_id: Any) -> None:
+    OwnerReplyContextStore().record_delivery(platform=platform, chat_id=str(chat_id or ""),
+        delivered_message_id=str(delivered_message_id or ""), owner_user_id=str(owner_user_id or ""),
+        session_id=str(session_id or ""))
 
 
 def reply_context_for_event(event: Any, source: Any) -> str:
-    """Return a fixed trusted note for a verified owner reply, or an empty string."""
-    binding = OwnerReplyContextStore().resolve_reply(
-        platform=getattr(source, "platform", ""),
-        chat_id=getattr(source, "chat_id", ""),
-        reply_to_message_id=getattr(event, "reply_to_message_id", ""),
-        owner_user_id=getattr(source, "user_id", ""),
-    )
-    if binding is None:
-        return ""
-    session_id = _safe_metadata_value(binding.session_id)
-    delivered_message_id = _safe_metadata_value(binding.delivered_message_id)
-    if session_id is None or delivered_message_id is None:
-        return ""
-    return (
-        "Verified owner reply binding: platform=telegram; "
-        f"session_id={session_id}; delivered_message_id={delivered_message_id}."
-    )
+    """Legacy lookup is intentionally inert: bindings never enter a model turn."""
+    return ""

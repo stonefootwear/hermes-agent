@@ -138,7 +138,7 @@ def test_inbound_context_requires_reply_id_and_same_owner(monkeypatch, tmp_path)
     source = SimpleNamespace(platform="telegram", chat_id="100", user_id="owner-1")
     event = SimpleNamespace(reply_to_message_id="200")
 
-    assert "session_id=session-1" in reply_context_for_event(event, source)
+    assert reply_context_for_event(event, source) == ""
     source.user_id = "owner-2"
     assert reply_context_for_event(event, source) == ""
 
@@ -163,10 +163,7 @@ def test_receipt_keeps_only_opaque_binding_metadata_and_resolves_platform_enum(
 
     source = SimpleNamespace(platform=Platform.TELEGRAM, chat_id="100", user_id="owner-1")
     context = reply_context_for_event(SimpleNamespace(reply_to_message_id="200"), source)
-    assert "session_id=session-1" in context
-    assert "delivered_message_id=200" in context
-    assert "@" not in context
-    assert "\n" not in context
+    assert context == ""
 
     store.record_delivery(
         platform=Platform.TELEGRAM,
