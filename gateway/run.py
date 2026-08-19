@@ -18168,6 +18168,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             else:
                 message_text = f'[Replying to: "{reply_snippet}"]\n\n{message_text}'
 
+        # Telegram does not reliably include quoted text for a reply to a bot
+        # message.  After the gateway's authorization path has admitted this
+        # event, recover only a receipt bound to this same owner identity and
+        # chat.  This is current-turn user content, never session/system prompt
+        # state, preserving prompt-cache prefixes and role alternation.
+        try:
+            from gateway.owner_reply_context import reply_context_for_event
+
+            owner_reply_context = await asyncio.to_thread(
+                reply_context_for_event, event, source
+            )
+            if owner_reply_context:
+                message_text = f"{owner_reply_context}\n\n{message_text}"
+        except Exception:
+            logger.debug("Owner reply-context lookup failed", exc_info=True)
+
         if "@" in message_text:
             try:
                 from agent.context_references import preprocess_context_references_async
