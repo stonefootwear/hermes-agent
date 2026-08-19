@@ -68,6 +68,66 @@ def test_survives_store_recreation_and_ignores_non_telegram(tmp_path):
     ).session_id == "session-1"
 
 
+def test_legacy_content_is_atomically_scrubbed_before_binding_resolution(tmp_path):
+    path = tmp_path / "owner_reply_context.json"
+    secret = "Legacy private assistant response"
+    path.write_text(
+        json.dumps(
+            {
+                "100:200": {
+                    "platform": "telegram",
+                    "chat_id": "100",
+                    "delivered_message_id": "200",
+                    "owner_user_id": "owner-1",
+                    "session_id": "session-1",
+                    "recorded_at": 1.0,
+                    "content": secret,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    store = OwnerReplyContextStore(home=tmp_path)
+
+    persisted = json.loads(path.read_text(encoding="utf-8"))
+    assert "content" not in persisted["100:200"]
+    assert secret not in path.read_text(encoding="utf-8")
+    assert store.resolve_reply(
+        platform="telegram", chat_id="100", reply_to_message_id="200", owner_user_id="owner-1"
+    ).session_id == "session-1"
+
+
+def test_legacy_scrub_write_failure_fails_closed(monkeypatch, tmp_path):
+    path = tmp_path / "owner_reply_context.json"
+    path.write_text(
+        json.dumps(
+            {
+                "100:200": {
+                    "platform": "telegram",
+                    "chat_id": "100",
+                    "delivered_message_id": "200",
+                    "owner_user_id": "owner-1",
+                    "session_id": "session-1",
+                    "recorded_at": 1.0,
+                    "content": "Legacy private assistant response",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def fail_write(*_args, **_kwargs):
+        raise OSError("read-only store")
+
+    monkeypatch.setattr(OwnerReplyContextStore, "_write", fail_write)
+    store = OwnerReplyContextStore(home=tmp_path)
+
+    assert store.resolve_reply(
+        platform="telegram", chat_id="100", reply_to_message_id="200", owner_user_id="owner-1"
+    ) is None
+
+
 def test_inbound_context_requires_reply_id_and_same_owner(monkeypatch, tmp_path):
     store = OwnerReplyContextStore(home=tmp_path)
     store.record_delivery(

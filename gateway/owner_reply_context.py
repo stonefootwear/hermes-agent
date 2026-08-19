@@ -55,6 +55,8 @@ class OwnerReplyContextStore:
     def __init__(self, home: Optional[Path] = None) -> None:
         self.home = Path(home) if home is not None else get_hermes_home()
         self.path = self.home / _STORE_FILENAME
+        # Scrub legacy assistant text before this store can resolve any binding.
+        self._read()
 
     @staticmethod
     def _key(chat_id: str, message_id: str) -> str:
@@ -63,9 +65,26 @@ class OwnerReplyContextStore:
     def _read(self) -> dict[str, dict[str, Any]]:
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
-            return data if isinstance(data, dict) else {}
         except (OSError, ValueError, TypeError):
             return {}
+        if not isinstance(data, dict):
+            return {}
+
+        sanitized = {
+            key: {field: value for field, value in raw.items() if field != "content"}
+            if isinstance(raw, dict) and "content" in raw
+            else raw
+            for key, raw in data.items()
+        }
+        if sanitized == data:
+            return data
+        try:
+            # Do not expose a legacy binding unless its on-disk assistant text
+            # has first been removed by the atomic writer.
+            self._write(sanitized)
+        except OSError:
+            return {}
+        return sanitized
 
     def _write(self, bindings: dict[str, dict[str, Any]]) -> None:
         self.home.mkdir(parents=True, exist_ok=True)
