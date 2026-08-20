@@ -44,11 +44,11 @@ def _mock_service(requests):
             assert body["actionHandle"] == ACTION_HANDLE
             assert body["draft"] == "رسالة للعميل"
             assert body["commandId"].startswith("owner-reply-")
-            return httpx.Response(200, json={"status": "drafted"})
+            return httpx.Response(200, json={"status": "drafted", "continuationHandle": "c" * 64})
         if request.url.path.endswith("/send"):
             assert request.headers["authorization"] == "Bearer action-secret"
-            assert body["actionHandle"] == ACTION_HANDLE
-            assert body["reply"] == "ابعت"
+            assert body["actionHandle"] == "c" * 64
+            assert "reply" not in body
             assert body["confirmation"] == "ابعت"
             assert body["commandId"].startswith("owner-reply-")
             return httpx.Response(200, json={"status": "sent_to_merchant"})
@@ -80,7 +80,7 @@ def test_bound_telegram_reply_exchanges_then_drafts_without_model_or_session_id(
     assert all(b"uuid" not in request.content.lower() for request in requests)
 
 
-def test_bound_telegram_send_reply_exchanges_then_sends_with_same_command_id_on_retry(tmp_path):
+def test_bound_telegram_draft_then_literal_send_rotates_the_same_receipt(tmp_path):
     store = OwnerReplyContextStore(home=tmp_path)
     store.record_delivery(
         platform="telegram", chat_id="chat-7", delivered_message_id="receipt-42",
@@ -92,11 +92,12 @@ def test_bound_telegram_send_reply_exchanges_then_sends_with_same_command_id_on_
         transport=_mock_service(requests), action_attempts=2,
     )
 
-    result = asyncio.run(execute_owner_reply_for_event(_event("ابعت"), _source(), store=store, client=client))
+    assert asyncio.run(execute_owner_reply_for_event(_event(), _source(), store=store, client=client)) == "تم حفظ المسودة. اكتب ابعت للإرسال."
+    assert asyncio.run(execute_owner_reply_for_event(_event("ابعت"), _source(), store=store, client=client)) == "تم إرسال الرد للعميل."
 
-    assert result == "تم إرسال الرد للعميل."
     assert [request.url.path for request in requests] == [
         "/api/internal/support-cases/owner-reply/exchange",
+        "/api/internal/support-cases/draft",
         "/api/internal/support-cases/send",
     ]
     assert len(json.loads(requests[-1].content)["commandId"]) <= 255
@@ -153,3 +154,35 @@ def test_gateway_runner_executes_bound_receipt_before_any_agent_path(monkeypatch
         "/api/internal/support-cases/owner-reply/exchange",
         "/api/internal/support-cases/draft",
     ]
+
+
+def test_action_timeout_after_server_mutation_replays_exact_command_id(tmp_path):
+    store = OwnerReplyContextStore(home=tmp_path)
+    store.record_delivery(platform="telegram", chat_id="chat-7", delivered_message_id="receipt-42", owner_user_id="owner-9", owner_profile_id="owner-profile", handle=HANDLE)
+    commands = []
+    attempts = 0
+    def handler(request):
+        nonlocal attempts
+        body = json.loads(request.content)
+        if request.url.path.endswith("exchange"):
+            return httpx.Response(200, json={"actionHandle": ACTION_HANDLE})
+        attempts += 1
+        commands.append(body["commandId"])
+        if attempts == 1:  # Fareeq mutated, but the response became ambiguous.
+            raise httpx.ReadTimeout("after mutation", request=request)
+        return httpx.Response(200, json={"status": "drafted", "continuationHandle": "c" * 64})
+    client = OwnerReplyCommandClient(base_url="https://fareeq.test", exchange_token="exchange-secret", action_token="action-secret", transport=httpx.MockTransport(handler), action_attempts=2)
+    assert asyncio.run(execute_owner_reply_for_event(_event(), _source(), store=store, client=client)) == "تم حفظ المسودة. اكتب ابعت للإرسال."
+    assert commands[0] == commands[1]
+
+
+def test_wrong_chat_profile_or_message_never_calls_fareeq(tmp_path):
+    store = OwnerReplyContextStore(home=tmp_path)
+    store.record_delivery(platform="telegram", chat_id="chat-7", delivered_message_id="receipt-42", owner_user_id="owner-9", owner_profile_id="owner-profile", handle=HANDLE)
+    client = OwnerReplyCommandClient(base_url="https://fareeq.test", exchange_token="exchange-secret", action_token="action-secret", transport=httpx.MockTransport(lambda _: pytest.fail("must not call Fareeq")))
+    wrong_chat = SimpleNamespace(platform="telegram", chat_id="other", user_id="owner-9", profile="owner-profile")
+    wrong_profile = SimpleNamespace(platform="telegram", chat_id="chat-7", user_id="owner-9", profile="other-profile")
+    wrong_message = SimpleNamespace(text="draft", reply_to_message_id="other")
+    assert asyncio.run(execute_owner_reply_for_event(_event(), wrong_chat, store=store, client=client)) is None
+    assert asyncio.run(execute_owner_reply_for_event(_event(), wrong_profile, store=store, client=client)) == "تعذر تنفيذ رد المالك. حاول مرة أخرى."
+    assert asyncio.run(execute_owner_reply_for_event(wrong_message, _source(), store=store, client=client)) is None

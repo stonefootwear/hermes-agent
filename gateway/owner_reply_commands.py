@@ -127,13 +127,12 @@ class OwnerReplyCommandClient:
         digest = hashlib.sha256(f"{action_handle}\0{action}\0{text}".encode("utf-8")).hexdigest()
         return f"owner-reply-{digest}"
 
-    async def execute(self, *, action_handle: str, text: str) -> str:
+    async def execute(self, *, action_handle: str, text: str, command_id: str) -> tuple[str, dict[str, Any]]:
         send = text == "ابعت"
         action = "send" if send else "draft"
-        command_id = self.command_id(action_handle=action_handle, action=action, text=text)
         body = {"actionHandle": action_handle, "commandId": command_id}
         if send:
-            body.update({"reply": text, "confirmation": "ابعت"})
+            body.update({"confirmation": "ابعت"})
             path, allowed = "/api/internal/support-cases/send", _SEND_STATUSES
         else:
             body["draft"] = text
@@ -141,7 +140,11 @@ class OwnerReplyCommandClient:
         payload = await self._post(path, body, self.action_token, attempts=self.action_attempts)
         if payload.get("status") not in allowed:
             raise OwnerReplyCommandError("action_status")
-        return SEND_SUCCESS if send else DRAFT_SUCCESS
+        if not send:
+            continuation = payload.get("continuationHandle")
+            if not isinstance(continuation, str) or not _HANDLE_RE.fullmatch(continuation):
+                raise OwnerReplyCommandError("continuation_shape")
+        return (SEND_SUCCESS if send else DRAFT_SUCCESS), payload
 
 
 async def execute_owner_reply_for_event(
@@ -173,10 +176,24 @@ async def execute_owner_reply_for_event(
     if client is None:
         return ACTION_UNAVAILABLE
     try:
-        action_handle = await client.exchange(
+        send = text == "ابعت"
+        # A draft must first exchange its initial receipt.  After a successful
+        # draft the receipt itself is rotated to Fareeq's separate continuation
+        # handle, so the literal confirmation consumes that handle directly.
+        action_handle = binding.handle if send else await client.exchange(
             handle=binding.handle, chat_id=chat_id, user_id=user_id,
             profile_id=profile_id, replied_message_id=reply_id,
         )
-        return await client.execute(action_handle=action_handle, text=text)
+        action = "send" if send else "draft"
+        command_id = client.command_id(action_handle=action_handle, action=action, text=text)
+        # Persist the exact opaque Fareeq action and deterministic command before
+        # the request. _post retries the same tuple after a timeout/mutation.
+        store.record_action(chat_id=chat_id, message_id=reply_id, owner_user_id=user_id,
+                            action_handle=action_handle, command_id=command_id, action=action)
+        result, payload = await client.execute(action_handle=action_handle, text=text, command_id=command_id)
+        if not send:
+            store.record_continuation(chat_id=chat_id, message_id=reply_id, owner_user_id=user_id,
+                                      continuation_handle=payload["continuationHandle"])
+        return result
     except (OwnerReplyCommandError, ValueError):
         return ACTION_FAILED
