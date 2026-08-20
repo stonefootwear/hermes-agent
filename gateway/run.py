@@ -16454,6 +16454,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
 
+        # A reply to an opaque Fareeq delivery receipt is a service command,
+        # not user prompt/context. Authorization above has already admitted
+        # the Telegram owner; execute it before pause/session/model handling so
+        # neither its opaque handle nor its text can enter an agent turn.
+        if not is_internal:
+            try:
+                from gateway.owner_reply_commands import (
+                    OwnerReplyCommandClient,
+                    execute_owner_reply_for_event,
+                )
+
+                owner_adapter = self._adapter_for_source(source)
+                owner_client = OwnerReplyCommandClient.from_platform_config(
+                    getattr(owner_adapter, "config", None)
+                )
+                owner_result = await execute_owner_reply_for_event(
+                    event, source, client=owner_client
+                )
+                if owner_result is not None:
+                    return owner_result
+            except Exception:
+                # Fail closed: a bound receipt must never fall through into the
+                # model path if service-client construction itself is unhealthy.
+                logger.warning("Opaque owner reply command failed closed", exc_info=True)
+                return "تعذر تنفيذ رد المالك. حاول مرة أخرى."
+
         # Global emergency stop (`hermes pause`): give new turns a brief
         # paused notice instead of starting an agent run. Internal events
         # (background-process completions from IN-FLIGHT work) bypass the

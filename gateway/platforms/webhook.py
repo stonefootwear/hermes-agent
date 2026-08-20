@@ -862,6 +862,11 @@ class WebhookAdapter(BasePlatformAdapter):
                     route_config.get("deliver_extra", {}), payload
                 ),
                 "payload": payload,
+                # Private pass-through for the opaque receipt hook. It never
+                # enters prompt rendering, and only direct Telegram delivery
+                # consumes it after a successful send.
+                "owner_reply_context": payload.get("owner_reply_context"),
+                "delivery_id": delivery_id,
             }
             logger.info(
                 "[webhook] direct-deliver event=%s route=%s target=%s msg_len=%d delivery=%s",
@@ -1459,4 +1464,38 @@ class WebhookAdapter(BasePlatformAdapter):
         if thread_id:
             metadata = {"thread_id": thread_id}
 
-        return await adapter.send(chat_id, content, metadata=metadata)
+        # Owner-reply context is private, structured receipt metadata. It is
+        # accepted only on a direct Telegram delivery and never becomes body
+        # text or any agent turn.
+        owner_reply_context = delivery.get("owner_reply_context")
+        if platform_name == "telegram" and isinstance(owner_reply_context, dict):
+            metadata = dict(metadata or {})
+            metadata["owner_reply_context"] = owner_reply_context
+            metadata["owner_reply_delivery_id"] = str(delivery.get("delivery_id") or "")
+
+        result = await adapter.send(chat_id, content, metadata=metadata)
+        # A direct delivery is reply-addressable only after Telegram has
+        # acknowledged it with a message id. Persist Fareeq's opaque handle;
+        # never case data or rendered message text.
+        context = metadata.get("owner_reply_context") if metadata else None
+        if (
+            getattr(result, "success", False)
+            and getattr(result, "message_id", None)
+            and isinstance(context, dict)
+        ):
+            try:
+                from gateway.opaque_owner_reply_context import (
+                    record_successful_delivery_receipt,
+                )
+
+                await asyncio.to_thread(
+                    record_successful_delivery_receipt,
+                    platform="telegram",
+                    chat_id=str(chat_id),
+                    delivered_message_id=str(result.message_id),
+                    owner_profile_id=str(context.get("owner_profile_id", "")),
+                    handle=str(context.get("handle", "")),
+                )
+            except Exception:
+                logger.debug("opaque owner reply receipt failed", exc_info=True)
+        return result
