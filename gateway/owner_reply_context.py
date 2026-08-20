@@ -1,11 +1,16 @@
 """Cross-process-safe opaque owner-reply delivery receipts.
 
-This store contains only Fareeq-issued opaque handles and verified delivery
-coordinates; case IDs, message text and model context are deliberately absent.
+This SQLite file is a protected operational-identity record, not prompt or
+forwarded metadata: it retains only the configured Telegram owner identity,
+chat ID, delivered message ID, profile, and Fareeq-issued opaque handles.
+Case IDs, message text, and model context are deliberately absent. Records
+expire after the bounded reply window and are removed before lookup.
 """
 from __future__ import annotations
 
+import os
 import sqlite3
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -25,16 +30,31 @@ class OwnerReplyBinding:
     action: str | None = None
 
 
+_REPLY_RETENTION_SECONDS = 300
+
+
+def configured_telegram_owner_user_id() -> str:
+    """Return the sole configured Telegram owner identity, else fail closed."""
+    values = {
+        value.strip()
+        for value in os.environ.get("TELEGRAM_ALLOWED_USERS", "").split(",")
+        if value.strip()
+    }
+    return values.pop() if len(values) == 1 else ""
+
+
 class OwnerReplyContextStore:
-    def __init__(self, home: Optional[Path] = None) -> None:
+    def __init__(self, home: Optional[Path] = None, retention_seconds: int = _REPLY_RETENTION_SECONDS) -> None:
         self.path = (Path(home) if home else get_hermes_home()) / "owner_reply_context.sqlite3"
+        self.retention_seconds = retention_seconds
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as db:
-            db.execute("CREATE TABLE IF NOT EXISTS owner_reply_receipts (chat_id TEXT NOT NULL, message_id TEXT NOT NULL, owner_user_id TEXT NOT NULL, owner_profile_id TEXT NOT NULL, handle TEXT NOT NULL, action_handle TEXT, command_id TEXT, action TEXT, PRIMARY KEY(chat_id, message_id))")
+            db.execute("CREATE TABLE IF NOT EXISTS owner_reply_receipts (chat_id TEXT NOT NULL, message_id TEXT NOT NULL, owner_user_id TEXT NOT NULL, owner_profile_id TEXT NOT NULL, handle TEXT NOT NULL, action_handle TEXT, command_id TEXT, action TEXT, expires_at REAL NOT NULL DEFAULT 0, PRIMARY KEY(chat_id, message_id))")
             columns = {row[1] for row in db.execute("PRAGMA table_info(owner_reply_receipts)")}
-            for column in ("action_handle", "command_id", "action"):
+            for column in ("action_handle", "command_id", "action", "expires_at"):
                 if column not in columns:
-                    db.execute(f"ALTER TABLE owner_reply_receipts ADD COLUMN {column} TEXT")
+                    db.execute(f"ALTER TABLE owner_reply_receipts ADD COLUMN {column} {'REAL' if column == 'expires_at' else 'TEXT'}")
+            db.execute("DELETE FROM owner_reply_receipts WHERE expires_at <= ?", (time.time(),))
 
     def _connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.path, timeout=5, isolation_level=None)
@@ -47,7 +67,7 @@ class OwnerReplyContextStore:
             return
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            db.execute("INSERT OR IGNORE INTO owner_reply_receipts (chat_id, message_id, owner_user_id, owner_profile_id, handle) VALUES (?, ?, ?, ?, ?)", (str(chat_id), str(delivered_message_id), str(owner_user_id), str(owner_profile_id), handle))
+            db.execute("INSERT OR IGNORE INTO owner_reply_receipts (chat_id, message_id, owner_user_id, owner_profile_id, handle, expires_at) VALUES (?, ?, ?, ?, ?, ?)", (str(chat_id), str(delivered_message_id), str(owner_user_id), str(owner_profile_id), handle, time.time() + self.retention_seconds))
             db.execute("COMMIT")
 
     def record_action(self, *, chat_id: str, message_id: str, owner_user_id: str, action_handle: str, command_id: str, action: str) -> None:
@@ -70,11 +90,17 @@ class OwnerReplyContextStore:
         if str(getattr(platform, "value", platform)).lower() != "telegram":
             return None
         with self._connect() as db:
-            row = db.execute("SELECT handle, owner_profile_id, chat_id, owner_user_id, message_id, action_handle, command_id, action FROM owner_reply_receipts WHERE chat_id=? AND message_id=? AND owner_user_id=?", (str(chat_id), str(reply_to_message_id), str(owner_user_id))).fetchone()
+            db.execute("DELETE FROM owner_reply_receipts WHERE expires_at <= ?", (time.time(),))
+            row = db.execute("SELECT handle, owner_profile_id, chat_id, owner_user_id, message_id, action_handle, command_id, action FROM owner_reply_receipts WHERE chat_id=? AND message_id=? AND owner_user_id=? AND expires_at > ?", (str(chat_id), str(reply_to_message_id), str(owner_user_id), time.time())).fetchone()
         return OwnerReplyBinding(*row) if row else None
 
 
 def record_successful_delivery_receipt(**kwargs: Any) -> None:
+    """Record only against Core's configured owner identity, never inbound metadata."""
+    owner_user_id = configured_telegram_owner_user_id()
+    if not owner_user_id:
+        return
+    kwargs["owner_user_id"] = owner_user_id
     OwnerReplyContextStore().record_delivery(**kwargs)
 
 

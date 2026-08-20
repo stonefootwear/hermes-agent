@@ -1488,7 +1488,6 @@ class WebhookAdapter(BasePlatformAdapter):
                     record_successful_delivery_receipt,
                     platform="telegram", chat_id=str(chat_id),
                     delivered_message_id=str(result.message_id),
-                    owner_user_id=str(context.get("owner_user_id", "")),
                     owner_profile_id=str(context.get("owner_profile_id", "")),
                     handle=str(context.get("handle", "")),
                 )

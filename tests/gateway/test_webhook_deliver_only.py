@@ -139,7 +139,6 @@ class TestDeliverOnlyBypassesAgent:
             "deliver_extra": {"chat_id": "12345"},
             "owner_reply_context": {
                 "handle": handle,
-                "owner_user_id": "777",
                 "owner_profile_id": "default",
             },
             "delivery_id": "event-1",
