@@ -6553,26 +6553,6 @@ class BasePlatformAdapter(ABC):
                         metadata=_final_thread_metadata,
                     )
                     _record_delivery(result)
-                    # Receipt is intentionally post-success only: an unacked
-                    # outbound ID must never become reply context.  The hook
-                    # takes scalar metadata rather than an adapter object so
-                    # durable owner-reply context remains a narrow core seam.
-                    if getattr(result, "success", False) and getattr(result, "message_id", None):
-                        try:
-                            from gateway.owner_reply_context import (
-                                record_successful_delivery_receipt,
-                            )
-
-                            await asyncio.to_thread(
-                                record_successful_delivery_receipt,
-                                platform=self.platform,
-                                chat_id=event.source.chat_id,
-                                delivered_message_id=result.message_id,
-                                owner_user_id=getattr(event.source, "user_id", None),
-                                session_id=session_key,
-                            )
-                        except Exception:
-                            logger.debug("Owner reply-context receipt failed", exc_info=True)
                     if _obligation_id is not None:
                         try:
                             from gateway.delivery_ledger import (

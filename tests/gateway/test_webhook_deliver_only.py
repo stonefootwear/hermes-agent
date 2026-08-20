@@ -122,7 +122,7 @@ class TestDeliverOnlyBypassesAgent:
     @pytest.mark.asyncio
     async def test_owner_reply_context_is_private_delivery_metadata(self):
         """Structured owner context reaches Telegram, never the rendered body."""
-        case_id = "123e4567-e89b-42d3-a456-426614174000"
+        handle = "a" * 64
         routes = {
             "owner-bridge": {
                 "secret": _INSECURE_NO_AUTH,
@@ -138,10 +138,9 @@ class TestDeliverOnlyBypassesAgent:
             "deliver": "telegram",
             "deliver_extra": {"chat_id": "12345"},
             "owner_reply_context": {
-                "case_id": case_id,
-                "project_ref": "fareeq-stores",
-                "tenant_ref": "tenant-opaque-1",
-                "owner_telegram_user_id": "777",
+                "handle": handle,
+                "owner_user_id": "777",
+                "owner_profile_id": "default",
             },
             "delivery_id": "event-1",
         }
