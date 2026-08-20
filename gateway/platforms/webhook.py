@@ -1472,4 +1472,26 @@ class WebhookAdapter(BasePlatformAdapter):
             metadata["owner_reply_context"] = owner_reply_context
             metadata["owner_reply_delivery_id"] = str(delivery.get("delivery_id") or "")
 
-        return await adapter.send(chat_id, content, metadata=metadata)
+        result = await adapter.send(chat_id, content, metadata=metadata)
+        # A direct delivery becomes reply-addressable only after Telegram has
+        # acknowledged it with a real message id.  Persist the Fareeq opaque
+        # handle only; never a case identifier or rendered text.
+        context = metadata.get("owner_reply_context") if metadata else None
+        if (
+            getattr(result, "success", False)
+            and getattr(result, "message_id", None)
+            and isinstance(context, dict)
+        ):
+            try:
+                from gateway.owner_reply_context import record_successful_delivery_receipt
+                await asyncio.to_thread(
+                    record_successful_delivery_receipt,
+                    platform="telegram", chat_id=str(chat_id),
+                    delivered_message_id=str(result.message_id),
+                    owner_user_id=str(context.get("owner_user_id", "")),
+                    owner_profile_id=str(context.get("owner_profile_id", "")),
+                    handle=str(context.get("handle", "")),
+                )
+            except Exception:
+                logger.debug("opaque owner reply receipt failed", exc_info=True)
+        return result
