@@ -442,7 +442,9 @@ seed_one "SOUL.md" "docker/SOUL.md"
 # volume), never overwrite an operator-provided value. Loopback-only: the
 # default bind host is 127.0.0.1 and the Fly service only exposes the
 # dashboard's port, so this listener is never publicly reachable.
-if [ -f "$HERMES_HOME/.env" ] && ! grep -q '^API_SERVER_KEY=..*' "$HERMES_HOME/.env" 2>/dev/null; then
+if [ -z "${API_SERVER_KEY:-}" ] && \
+   [ -f "$HERMES_HOME/.env" ] && \
+   ! grep -q '^API_SERVER_KEY=..*' "$HERMES_HOME/.env" 2>/dev/null; then
     if refuse_symlinked_path "append" "$HERMES_HOME/.env"; then
         :
     else
